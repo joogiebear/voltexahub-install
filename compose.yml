@@ -1,0 +1,80 @@
+# VoltexaHub self-hosted stack. Installed to /opt/voltexahub by install.sh; do not edit by hand,
+# updates replace this file. Local changes belong in compose.override.yml.
+name: voltexahub
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  # The only service that publishes ports. Terminates HTTPS and forwards to web.
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    logging: *logging
+
+  web:
+    image: ${VOLTEXAHUB_IMAGE:?set by install.sh}
+    restart: unless-stopped
+    env_file: app.env
+    # Port 8080 is internal to the compose network and never published. That is what makes
+    # TRUSTED_PROXIES=* safe here: only caddy can reach it.
+    expose:
+      - "8080"
+    volumes:
+      - uploads:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/up') === false ? 1 : 0);"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    logging: *logging
+
+  # Queue worker plus the minute scheduler (deploy/worker.sh). Without it email, reply
+  # notifications and billing stop silently. Waits for web so migrations have already run.
+  worker:
+    image: ${VOLTEXAHUB_IMAGE:?set by install.sh}
+    restart: unless-stopped
+    command: ["sh", "deploy/worker.sh"]
+    env_file: app.env
+    depends_on:
+      web:
+        condition: service_healthy
+    logging: *logging
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file: mysql.env
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging: *logging
+
+volumes:
+  mysql-data:
+  uploads:
+  caddy-data:
+  caddy-config:
