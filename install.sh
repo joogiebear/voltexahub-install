@@ -408,7 +408,8 @@ fi
 # ---------------------------------------------------------------------------------------------
 log "Checking https://${DOMAIN}/up"
 CURL_OPTS=(-sS -o /dev/null -m 10 -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1")
-[ "$LOCAL_CA" -eq 1 ] && CURL_OPTS+=(-k)
+# A staging or internal CA certificate is not trusted by curl, so skip verification for this local check only.
+[ "$LOCAL_CA" -eq 1 ] || [ "$ACME_STAGING" -eq 1 ] && CURL_OPTS+=(-k)
 HTTPS_OK=0
 for _ in $(seq 1 24); do
   code="$(curl "${CURL_OPTS[@]}" "https://${DOMAIN}/up" 2>/dev/null || true)"

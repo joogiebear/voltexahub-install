@@ -52,7 +52,7 @@ envval() { sed -n "s/^$2=//p" "$1" | head -n 1; }
 site_url() { envval "$DIR/app.env" APP_URL; }
 site_host() { site_url | sed 's#^https\?://##; s#/.*##'; }
 image_ref() { envval "$DIR/.env" VOLTEXAHUB_IMAGE; }
-local_ca() { grep -q 'local_certs' "$DIR/Caddyfile" 2>/dev/null; }
+local_ca() { grep -q -E 'local_certs|acme-staging' "$DIR/Caddyfile" 2>/dev/null; } # certificates curl cannot verify
 
 https_code() { # prints the HTTP status of /up through the local Caddy
   local host opts=(-s -o /dev/null -w '%{http_code}' --max-time 10)
