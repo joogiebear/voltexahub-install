@@ -145,6 +145,7 @@ if [ -f "$DIR/.install-complete" ]; then
   log "VoltexaHub is already installed in $DIR. Your configuration, secrets and data are untouched."
   command -v docker >/dev/null 2>&1 || die "Docker is not installed, so the existing stack cannot be started."
   install_cli
+  install -m 644 "$SCRIPT_DIR/compose.yml" "$DIR/compose.yml"
   cd "$DIR"
   docker compose up -d --wait --wait-timeout 300
   url="$(sed -n 's/^APP_URL=//p' "$DIR/app.env" | head -n 1)"
