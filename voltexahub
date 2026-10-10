@@ -259,7 +259,10 @@ cmd_update() {
   local backup="$BACKUP_FILE"
 
   log "Pulling $new"
-  docker pull "$new" >/dev/null || die "Could not pull $new. Nothing was changed."
+  if ! docker pull "$new" >/dev/null 2>&1; then
+    docker image inspect "$new" >/dev/null 2>&1 || die "Could not pull $new. Nothing was changed."
+    warn "Could not pull $new; using the copy already on this server."
+  fi
   if [ "$new" = "$cur" ] && [ -n "$prev_id" ] && [ "$(docker image inspect "$new" --format '{{.Id}}')" = "$prev_id" ]; then
     log "Already running the newest image for $new. Nothing to do."
     return 0
