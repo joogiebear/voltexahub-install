@@ -32,7 +32,7 @@ Commands:
   version                Show the CLI and application image versions.
   doctor                 Check that the install is healthy (exit code 1 if something is wrong).
   backup [--keep N] [--dir PATH] [--quiet]
-                         Database, uploads and configuration in one archive with a checksum. Keeps the newest N (default 7).
+                         Database, uploads and configuration in one archive with a checksum. Keeps the newest N (default 7); pre-update and pre-restore backups keep the newest 5.
   restore FILE [--yes] [--no-safety-backup]
                          Replace the database, uploads and app settings with the contents of a backup.
   update [VERSION|IMAGE] Back up, pull a newer image, restart, and roll back automatically if it does not become healthy.
@@ -159,10 +159,9 @@ do_backup() { # do_backup dir prefix keep ; sets BACKUP_FILE
   chmod 600 "$final"
   (cd "$out" && sha256sum "$(basename "$final")" >"$(basename "$final").sha256" && chmod 600 "$(basename "$final").sha256")
 
-  # Keep only the newest N regular backups. Pre-restore and pre-update backups are never pruned automatically.
-  if [ "$prefix" = "voltexahub-backup" ]; then
-    ls -1t "$out"/voltexahub-backup-*.tar 2>/dev/null | tail -n +"$((keep + 1))" | while read -r old; do rm -f "$old" "$old.sha256"; done
-  fi
+  # Keep the newest N nightly backups; pre-update and pre-restore backups keep the newest 5 of their own kind.
+  [ "$prefix" = "voltexahub-backup" ] || keep=5
+  ls -1t "$out/${prefix}"-*.tar 2>/dev/null | tail -n +"$((keep + 1))" | while read -r old; do rm -f "$old" "$old.sha256"; done
   BACKUP_FILE="$final"
   log "Backup written: $final ($(du -h "$final" | cut -f1)). It contains secrets: keep it private and copy it off this server."
 }
