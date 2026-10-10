@@ -71,4 +71,4 @@ The restore brings back your content, uploads and the original `APP_KEY` (needed
 
 ## Status
 
-Tested on a clean Debian 13 VM: Docker install, resume, re-run, restart, backup, restore in place, restore onto a freshly installed server with different secrets, tamper detection, update with automatic rollback of a broken image, doctor catching a stopped worker, support bundle without secrets. Not yet tested: Ubuntu, arm64 (the image is amd64 only), real Let's Encrypt issuance from this script, an update between two real published versions.
+Tested on clean Debian 13 and Ubuntu 24.04 VMs (Docker install from scratch, install, doctor and backup on Ubuntu). The full set on Debian 13: Docker install, resume, re-run, restart, backup, restore in place, restore onto a freshly installed server with different secrets, tamper detection, update with automatic rollback of a broken image, doctor catching a stopped worker, support bundle without secrets. Not yet tested: Ubuntu 22.04, Debian 12, arm64 (the image is amd64 only), real Let's Encrypt issuance from this script, an update between two real published versions.
