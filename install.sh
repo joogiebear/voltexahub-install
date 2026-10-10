@@ -100,11 +100,52 @@ ask() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# The voltexahub command and the nightly backup timer. Safe to run again; also refreshed when an
+# already installed server runs this script from a newer download.
+# ---------------------------------------------------------------------------------------------
+install_cli() {
+  [ -f "$SCRIPT_DIR/voltexahub" ] || { warn "The voltexahub command was not found next to install.sh; skipping."; return 0; }
+  install -m 755 "$SCRIPT_DIR/voltexahub" /usr/local/bin/voltexahub
+  if [ "$DIR" != "/opt/voltexahub" ]; then
+    printf 'VOLTEXAHUB_DIR=%s\n' "$DIR" >/etc/default/voltexahub
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat >/etc/systemd/system/voltexahub-backup.service <<'UNIT'
+[Unit]
+Description=VoltexaHub nightly backup
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/voltexahub backup --quiet --keep 7
+UNIT
+    cat >/etc/systemd/system/voltexahub-backup.timer <<'UNIT'
+[Unit]
+Description=Run the VoltexaHub backup every night
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now voltexahub-backup.timer >/dev/null 2>&1 || warn "Could not enable the nightly backup timer."
+  else
+    warn "systemd was not found, so no nightly backup was scheduled. Run: sudo voltexahub backup"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
 # An install that finished earlier is left alone.
 # ---------------------------------------------------------------------------------------------
 if [ -f "$DIR/.install-complete" ]; then
   log "VoltexaHub is already installed in $DIR. Your configuration, secrets and data are untouched."
   command -v docker >/dev/null 2>&1 || die "Docker is not installed, so the existing stack cannot be started."
+  install_cli
+  install -m 644 "$SCRIPT_DIR/compose.yml" "$DIR/compose.yml"
   cd "$DIR"
   docker compose up -d --wait --wait-timeout 300
   url="$(sed -n 's/^APP_URL=//p' "$DIR/app.env" | head -n 1)"
@@ -378,6 +419,7 @@ for _ in $(seq 1 24); do
   sleep 5
 done
 
+install_cli
 touch "$DIR/.install-complete"
 chmod 600 "$DIR/.install-complete"
 
@@ -404,6 +446,8 @@ echo " Back up ${DIR}/app.env now. It holds APP_KEY, which cannot be recovered: 
 echo " it, encrypted settings (mail credentials and similar) are unreadable after a restore."
 echo
 echo " Next: sign in, open the admin setup checklist, and configure outgoing email."
+echo " Backups run every night into ${DIR}/backups (newest 7 kept). They contain secrets: copy them"
+echo " off this server. Commands: sudo voltexahub doctor | backup | restore | update | status"
 echo " Until then, emails (verification, password resets) are only written to the log."
 if [ "$LOCAL_CA" -eq 1 ]; then
   echo
