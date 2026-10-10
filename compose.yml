@@ -54,6 +54,12 @@ services:
     restart: unless-stopped
     command: ["sh", "deploy/worker.sh"]
     env_file: app.env
+    # The image ships a web-server healthcheck (it probes FrankenPHP's admin port), which can never
+    # pass here because the worker does not run a web server, and `up --wait` would wait for it
+    # until timeout. deploy/worker.sh exits if the queue worker or scheduler dies and Docker
+    # restarts the container; `voltexahub doctor` will check that jobs are actually being processed.
+    healthcheck:
+      disable: true
     depends_on:
       web:
         condition: service_healthy
