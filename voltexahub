@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# voltexahub: day-to-day tool for a VoltexaHub install made by install.sh.
+# Licensed under AGPL-3.0-or-later. See https://github.com/joogiebear/voltexahub-install
+set -Eeuo pipefail
+
+CLI_VERSION="0.1.0"
+[ -r /etc/default/voltexahub ] && . /etc/default/voltexahub
+DIR="${VOLTEXAHUB_DIR:-/opt/voltexahub}"
+BACKUP_DIR="${VOLTEXAHUB_BACKUP_DIR:-$DIR/backups}"
+
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_BAD=$'\033[31m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_BAD=""; C_OFF=""
+fi
+QUIET=0
+CLEANUP=()
+cleanup() { local d; for d in "${CLEANUP[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done; return 0; }
+trap cleanup EXIT
+
+log() { [ "$QUIET" -eq 1 ] || printf '==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: voltexahub <command> [options]
+
+Commands:
+  status                 Show containers, version, site address and the latest backup.
+  logs [service] [...]   Follow logs (services: caddy, web, worker, mysql). Extra args go to docker compose logs.
+  version                Show the CLI and application image versions.
+  doctor                 Check that the install is healthy (exit code 1 if something is wrong).
+  backup [--keep N] [--dir PATH] [--quiet]
+                         Database, uploads and configuration in one archive with a checksum. Keeps the newest N (default 7).
+  restore FILE [--yes] [--no-safety-backup]
+                         Replace the database, uploads and app settings with the contents of a backup.
+  update [VERSION|IMAGE] Back up, pull a newer image, restart, and roll back automatically if it does not become healthy.
+  support-bundle         Collect redacted diagnostics into one file for a bug report.
+
+The install lives in /opt/voltexahub (override with VOLTEXAHUB_DIR). Needs root.
+EOF
+}
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "Run this as root, for example: sudo voltexahub $CMD"; }
+need_install() {
+  [ -f "$DIR/compose.yml" ] && [ -f "$DIR/app.env" ] || die "No install found in $DIR."
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed."
+}
+dc() { (cd "$DIR" && docker compose "$@"); }
+envval() { sed -n "s/^$2=//p" "$1" | head -n 1; }
+site_url() { envval "$DIR/app.env" APP_URL; }
+site_host() { site_url | sed 's#^https\?://##; s#/.*##'; }
+image_ref() { envval "$DIR/.env" VOLTEXAHUB_IMAGE; }
+local_ca() { grep -q 'local_certs' "$DIR/Caddyfile" 2>/dev/null; }
+
+https_code() { # prints the HTTP status of /up through the local Caddy
+  local host opts=(-s -o /dev/null -w '%{http_code}' --max-time 10)
+  host="$(site_host)"
+  local_ca && opts+=(-k)
+  curl "${opts[@]}" --resolve "${host}:443:127.0.0.1" "https://${host}/up" 2>/dev/null || true
+}
+
+wait_for_up() { # wait_for_up seconds
+  local end=$((SECONDS + $1))
+  while [ "$SECONDS" -lt "$end" ]; do
+    [ "$(https_code)" = "200" ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+lock() {
+  exec 8>/var/lock/voltexahub-cli.lock
+  flock -n 8 || die "Another voltexahub backup, restore or update is already running."
+}
+
+latest_backup() { ls -1t "$BACKUP_DIR"/voltexahub-*.tar 2>/dev/null | head -n 1 || true; }
+
+# ------------------------------------------------------------------------------------------
+cmd_status() {
+  need_install
+  dc ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}'
+  echo
+  echo "Site:    $(site_url)"
+  echo "Image:   $(image_ref)"
+  echo "Health:  /up answers $(https_code)"
+  local b
+  b="$(latest_backup)"
+  if [ -n "$b" ]; then echo "Backup:  $(basename "$b") ($(date -r "$b" '+%Y-%m-%d %H:%M'))"; else echo "Backup:  none yet (run: sudo voltexahub backup)"; fi
+}
+
+cmd_logs() {
+  need_install
+  local args=("$@")
+  [ ${#args[@]} -gt 0 ] || args=(--tail 100 -f)
+  case "${args[0]}" in
+    caddy | web | worker | mysql) local svc="${args[0]}"; args=("${args[@]:1}"); [ ${#args[@]} -gt 0 ] || args=(--tail 100 -f); dc logs "${args[@]}" "$svc" ;;
+    *) dc logs "${args[@]}" ;;
+  esac
+}
+
+cmd_version() {
+  echo "voltexahub CLI $CLI_VERSION"
+  [ -f "$DIR/.env" ] || return 0
+  local img id
+  img="$(image_ref)"
+  echo "Image: $img"
+  id="$(docker image inspect "$img" --format '{{index .Config.Labels "org.opencontainers.image.version"}} {{.Id}}' 2>/dev/null || true)"
+  [ -n "$id" ] && echo "Application: $id"
+  return 0
+}
+
+# ------------------------------------------------------------------------------------------
+cmd_backup() {
+  local keep=7 out="$BACKUP_DIR"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep) keep="${2:?--keep needs a number}"; shift 2 ;;
+      --dir) out="${2:?--dir needs a path}"; shift 2 ;;
+      --quiet) QUIET=1; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  case "$keep" in '' | *[!0-9]*) die "--keep needs a number" ;; esac
+  need_root; need_install; lock
+  do_backup "$out" "voltexahub-backup" "$keep"
+}
+
+do_backup() { # do_backup dir prefix keep ; sets BACKUP_FILE
+  local out="$1" prefix="$2" keep="$3" ts stage final
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 700 "$out"
+  stage="$(mktemp -d "$out/.tmp-XXXXXX")"
+  CLEANUP+=("$stage")
+  dc ps --status running --services | grep -qx mysql || die "The database container is not running. Start the stack first: cd $DIR && docker compose up -d"
+
+  log "Dumping the database"
+  dc exec -T mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction --routines --triggers --no-tablespaces "$MYSQL_DATABASE"' | gzip -c >"$stage/db.sql.gz"
+  [ "$(gzip -dc "$stage/db.sql.gz" | tail -c 200 | grep -c 'Dump completed')" -ge 1 ] || die "The database dump looks incomplete. No backup was written."
+
+  log "Archiving uploads"
+  dc run --rm --no-deps -T --entrypoint sh web -c 'mkdir -p /data && tar -C /data -czf - .' >"$stage/uploads.tar.gz" 2>/dev/null
+  gzip -t "$stage/uploads.tar.gz" || die "The uploads archive is damaged. No backup was written."
+
+  log "Saving configuration"
+  mkdir "$stage/config"
+  for f in app.env mysql.env .env Caddyfile; do cp -p "$DIR/$f" "$stage/config/$f"; done
+  {
+    echo "created=$ts"
+    echo "cli=$CLI_VERSION"
+    echo "site=$(site_url)"
+    echo "image=$(image_ref)"
+    echo "image_id=$(docker image inspect "$(image_ref)" --format '{{.Id}}' 2>/dev/null || true)"
+  } >"$stage/manifest.txt"
+
+  final="$out/${prefix}-${ts}.tar"
+  tar -cf "$final" -C "$stage" .
+  chmod 600 "$final"
+  (cd "$out" && sha256sum "$(basename "$final")" >"$(basename "$final").sha256" && chmod 600 "$(basename "$final").sha256")
+
+  # Keep only the newest N regular backups. Pre-restore and pre-update backups are never pruned automatically.
+  if [ "$prefix" = "voltexahub-backup" ]; then
+    ls -1t "$out"/voltexahub-backup-*.tar 2>/dev/null | tail -n +"$((keep + 1))" | while read -r old; do rm -f "$old" "$old.sha256"; done
+  fi
+  BACKUP_FILE="$final"
+  log "Backup written: $final ($(du -h "$final" | cut -f1)). It contains secrets: keep it private and copy it off this server."
+}
+
+# ------------------------------------------------------------------------------------------
+cmd_restore() {
+  local file="" yes=0 safety=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes | -y) yes=1; shift ;;
+      --no-safety-backup) safety=0; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) [ -z "$file" ] || die "Only one backup file can be restored."; file="$1"; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die "Usage: voltexahub restore FILE [--yes]"
+  need_root; need_install; lock
+  [ -f "$file" ] || die "File not found: $file"
+  file="$(readlink -f "$file")"
+
+  if [ -f "$file.sha256" ]; then
+    (cd "$(dirname "$file")" && sha256sum -c --status "$(basename "$file").sha256") || die "Checksum mismatch: the backup is damaged or was altered. Nothing was changed."
+    log "Checksum verified"
+  else
+    warn "No .sha256 file next to the backup, so its integrity cannot be checked."
+  fi
+
+  local work
+  work="$(mktemp -d "$(dirname "$BACKUP_DIR")/.restore-XXXXXX")"
+  chmod 700 "$work"
+  CLEANUP+=("$work")
+  tar -xf "$file" -C "$work"
+  for f in db.sql.gz uploads.tar.gz config/app.env manifest.txt; do [ -f "$work/$f" ] || die "Not a VoltexaHub backup (missing $f). Nothing was changed."; done
+  gzip -t "$work/db.sql.gz" && gzip -t "$work/uploads.tar.gz" || die "The backup contents are damaged. Nothing was changed."
+
+  echo "Backup from: $(sed -n 's/^created=//p' "$work/manifest.txt") (site $(sed -n 's/^site=//p' "$work/manifest.txt"))"
+  echo "This REPLACES the database, uploaded files and app settings on this server ($(site_url))."
+  if [ "$yes" -ne 1 ]; then
+    [ -t 0 ] || die "Refusing to restore without --yes when there is no terminal."
+    read -r -p "Type 'restore' to continue: " answer
+    [ "$answer" = "restore" ] || die "Cancelled. Nothing was changed."
+  fi
+
+  if [ "$safety" -eq 1 ] && dc ps --status running --services | grep -qx mysql; then
+    log "Taking a safety backup of the current state first"
+    do_backup "$BACKUP_DIR" "voltexahub-prerestore" 0
+  fi
+
+  log "Stopping the site"
+  dc stop caddy web worker >/dev/null
+  dc up -d --wait --wait-timeout 180 mysql >/dev/null
+
+  log "Restoring the database"
+  dc exec -T mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -e "DROP DATABASE IF EXISTS \`$MYSQL_DATABASE\`; CREATE DATABASE \`$MYSQL_DATABASE\`; GRANT ALL ON \`$MYSQL_DATABASE\`.* TO \"$MYSQL_USER\"@\"%\";"'
+  gzip -dc "$work/db.sql.gz" | dc exec -T mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot "$MYSQL_DATABASE"'
+
+  log "Restoring uploads"
+  dc run --rm --no-deps -T --entrypoint sh web -c 'rm -rf /data/uploads /data/.[!.]* 2>/dev/null; mkdir -p /data && tar -C /data -xzf - && mkdir -p /data/uploads && chown -R 10001:10001 /data/uploads' <"$work/uploads.tar.gz" 2>/dev/null
+
+  # Keep this server's database credentials and address; take everything else (APP_KEY, mail settings, ...) from the backup.
+  log "Restoring app settings (APP_KEY and others; this server's database login and address are kept)"
+  cp -p "$DIR/app.env" "$DIR/app.env.pre-restore"
+  { grep -v -E '^(DB_[A-Z_]+|APP_URL)=' "$work/config/app.env" || true; grep -E '^(DB_[A-Z_]+|APP_URL)=' "$DIR/app.env.pre-restore" || true; } >"$DIR/app.env.new"
+  chmod 600 "$DIR/app.env.new"
+  mv "$DIR/app.env.new" "$DIR/app.env"
+
+  log "Starting the site (pending migrations run on boot)"
+  dc up -d --wait --wait-timeout 300
+  if wait_for_up 120; then
+    log "Restore complete. $(site_url) is answering."
+    echo "The previous app settings were kept as $DIR/app.env.pre-restore (it contains secrets; delete it when you are done)."
+  else
+    die "Restored, but the site is not answering yet. Check: voltexahub doctor"
+  fi
+}
+
+# ------------------------------------------------------------------------------------------
+cmd_update() {
+  need_root; need_install; lock
+  local target="${1:-}" cur new prev_id repo
+  cur="$(image_ref)"
+  if [ -z "$target" ]; then
+    new="$cur"
+  elif [[ "$target" == *[:/@]* ]]; then
+    new="$target"
+  else
+    repo="${cur%%@*}"; repo="${repo%:*}"
+    new="${repo}:${target}"
+  fi
+  prev_id="$(docker inspect "$(dc ps -q web)" --format '{{.Image}}' 2>/dev/null || true)"
+
+  log "Backing up before the update"
+  do_backup "$BACKUP_DIR" "voltexahub-preupdate" 0
+  local backup="$BACKUP_FILE"
+
+  log "Pulling $new"
+  docker pull "$new" >/dev/null || die "Could not pull $new. Nothing was changed."
+  if [ "$new" = "$cur" ] && [ -n "$prev_id" ] && [ "$(docker image inspect "$new" --format '{{.Id}}')" = "$prev_id" ]; then
+    log "Already running the newest image for $new. Nothing to do."
+    return 0
+  fi
+
+  sed -i "s#^VOLTEXAHUB_IMAGE=.*#VOLTEXAHUB_IMAGE=${new}#" "$DIR/.env"
+  log "Restarting with the new image (database migrations run automatically)"
+  dc pull --quiet caddy mysql >/dev/null 2>&1 || true
+  if dc up -d --wait --wait-timeout 300 && wait_for_up 120; then
+    log "Updated. $(site_url) is answering. Image: $new"
+    return 0
+  fi
+
+  warn "The new version did not become healthy."
+  if [ -n "$prev_id" ]; then
+    warn "Rolling back to the previous image."
+    sed -i "s#^VOLTEXAHUB_IMAGE=.*#VOLTEXAHUB_IMAGE=${prev_id}#" "$DIR/.env"
+    dc up -d --wait --wait-timeout 300 || true
+    if [[ "$cur" != *@* ]]; then
+      # Point the tag back at the old image so a later "docker compose up" does not bring the broken one back.
+      docker tag "$prev_id" "$cur" 2>/dev/null && sed -i "s#^VOLTEXAHUB_IMAGE=.*#VOLTEXAHUB_IMAGE=${cur}#" "$DIR/.env"
+    fi
+  fi
+  echo "Database migrations are not reversible. If the old version still misbehaves, restore the pre-update backup:"
+  echo "  sudo voltexahub restore $backup --yes"
+  exit 1
+}
+
+# ------------------------------------------------------------------------------------------
+DOC_FAIL=0
+ok() { printf '  %s[ ok ]%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+note() { printf '  %s[warn]%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
+bad() { printf '  %s[FAIL]%s %s\n' "$C_BAD" "$C_OFF" "$*"; DOC_FAIL=1; }
+
+sql() { dc exec -T mysql sh -c "MYSQL_PWD=\"\$MYSQL_ROOT_PASSWORD\" mysql -uroot -N -B \"\$MYSQL_DATABASE\" -e \"$1\"" 2>/dev/null; }
+
+cmd_doctor() {
+  need_root; need_install
+  echo "VoltexaHub doctor ($(site_url))"
+
+  docker info >/dev/null 2>&1 && ok "Docker is running" || { bad "Docker is not running"; exit 1; }
+
+  local running svc
+  running="$(dc ps --status running --services 2>/dev/null || true)"
+  for svc in caddy web worker mysql; do
+    if grep -qx "$svc" <<<"$running"; then ok "$svc is running"; else bad "$svc is not running (try: cd $DIR && docker compose up -d; logs: voltexahub logs $svc)"; fi
+  done
+
+  local health
+  health="$(docker inspect "$(dc ps -q web 2>/dev/null)" --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' 2>/dev/null || true)"
+  [ "$health" = "healthy" ] && ok "web reports healthy" || bad "web health is '${health:-unknown}'"
+
+  local code
+  code="$(https_code)"
+  [ "$code" = "200" ] && ok "https://$(site_host)/up answers 200" || bad "https://$(site_host)/up answered '${code:-nothing}' (certificate still being issued, or DNS / ports 80 and 443 not reachable?)"
+
+  if grep -qx worker <<<"$running"; then
+    local procs
+    procs="$(dc exec -T worker sh -c 'for p in /proc/[0-9]*; do tr "\0" " " <"$p/cmdline" 2>/dev/null; echo; done' 2>/dev/null || true)"
+    grep -q 'queue:work' <<<"$procs" && ok "queue worker process is running" || bad "queue worker process not found: email and notifications will not be sent"
+    grep -q 'billing-scheduler' <<<"$procs" && ok "scheduler loop is running" || bad "scheduler loop not found"
+  fi
+
+  if grep -qx mysql <<<"$running"; then
+    local failed stale
+    failed="$(sql 'SELECT COUNT(*) FROM failed_jobs' || true)"
+    stale="$(sql 'SELECT COUNT(*) FROM jobs WHERE created_at < UNIX_TIMESTAMP() - 600' || true)"
+    if [ -z "$failed" ]; then note "could not read the queue tables"; else
+      [ "$failed" = "0" ] && ok "no failed jobs" || note "$failed failed job(s) (see: voltexahub logs worker)"
+      [ "${stale:-0}" = "0" ] && ok "no jobs waiting longer than 10 minutes" || bad "$stale job(s) waiting longer than 10 minutes: the worker may be stuck"
+    fi
+  fi
+
+  local pct
+  pct="$(df --output=pcent "$DIR" | tail -n 1 | tr -dc 0-9)"
+  if [ -n "$pct" ]; then
+    if [ "$pct" -ge 95 ]; then bad "disk is ${pct}% full"; elif [ "$pct" -ge 85 ]; then note "disk is ${pct}% full"; else ok "disk is ${pct}% full"; fi
+  fi
+
+  if ! local_ca; then
+    local end days
+    end="$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$(site_host)" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)"
+    if [ -n "$end" ]; then
+      days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+      if [ "$days" -lt 7 ]; then bad "certificate expires in $days days"; elif [ "$days" -lt 14 ]; then note "certificate expires in $days days"; else ok "certificate valid for $days more days"; fi
+    else
+      note "could not read the HTTPS certificate"
+    fi
+  fi
+
+  [ "$(stat -c %a "$DIR/app.env")" = "600" ] && ok "app.env is private (600)" || note "app.env permissions are not 600: chmod 600 $DIR/app.env"
+  grep -q '^MAIL_MAILER=log' "$DIR/app.env" && note "outgoing email is set to 'log' in app.env; unless you configured mail in the admin panel, emails are only written to the log"
+
+  local b age
+  b="$(latest_backup)"
+  if [ -z "$b" ]; then
+    note "no backup yet: sudo voltexahub backup"
+  else
+    age=$(( ($(date +%s) - $(stat -c %Y "$b")) / 3600 ))
+    if [ "$age" -gt 48 ]; then note "latest backup is $age hours old"; else ok "latest backup is $age hours old"; fi
+  fi
+
+  [ "$DOC_FAIL" -eq 0 ] && echo "All essential checks passed." || { echo "Some checks failed."; exit 1; }
+}
+
+# ------------------------------------------------------------------------------------------
+redact() {
+  sed -E \
+    -e 's#base64:[A-Za-z0-9+/=]{20,}#<redacted-key>#g' \
+    -e 's#(password|passwd|secret|token|api[_-]?key)([=:" ]+)[^ ",&]+#\1\2<redacted>#Ig'
+}
+
+cmd_support_bundle() {
+  need_root; need_install
+  local ts out work
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  work="$(mktemp -d)"
+  CLEANUP+=("$work")
+  out="$BACKUP_DIR/support-bundle-$ts.tar.gz"
+  install -d -m 700 "$BACKUP_DIR"
+  {
+    echo "voltexahub CLI $CLI_VERSION"; cmd_version 2>&1 || true
+    echo; head -n 3 /etc/os-release; uname -srm; free -m | head -n 2; df -h "$DIR" | tail -n 1
+    docker version --format 'docker {{.Server.Version}}' 2>&1 || true
+    echo; dc ps 2>&1 || true
+  } 2>&1 | redact >"$work/system.txt"
+  cmd_doctor 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | redact >"$work/doctor.txt" || true
+  sed -E 's/^([A-Za-z_]*(PASSWORD|KEY|SECRET|TOKEN)[A-Za-z_]*)=.*/\1=<redacted>/' "$DIR/app.env" >"$work/app.env.redacted"
+  cp "$DIR/Caddyfile" "$work/Caddyfile"
+  for svc in caddy web worker mysql; do dc logs --no-color --tail 500 "$svc" 2>&1 | redact >"$work/log-$svc.txt" || true; done
+  tar -czf "$out" -C "$work" .
+  chmod 600 "$out"
+  log "Support bundle: $out"
+  echo "Secrets and keys are masked, but logs can still contain email addresses and IPs of your members. Read it before sharing."
+}
+
+# ------------------------------------------------------------------------------------------
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$CMD" in
+  status) cmd_status "$@" ;;
+  logs) cmd_logs "$@" ;;
+  version | --version) cmd_version ;;
+  doctor) cmd_doctor "$@" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  update) cmd_update "$@" ;;
+  support-bundle) cmd_support_bundle "$@" ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; die "Unknown command: $CMD" ;;
+esac
