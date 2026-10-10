@@ -1,0 +1,4 @@
+# Keep line endings LF everywhere: install.sh must run on Linux even when checked out on Windows.
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
